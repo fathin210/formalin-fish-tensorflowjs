@@ -1,117 +1,82 @@
+const express = require('express');
 const tf = require('@tensorflow/tfjs-node');
 const fs = require('fs');
 const path = require('path');
+const cors = require('cors')
 
-// Constants for image directories, batch size, and image size
-const trainDir = "./train";  // Update train directory path
-const batchSize = 32;
-const imageHeight = 256;
-const imageWidth = 256;
+const app = express();
+const port = 4000;
 
-// Function to load and preprocess image data
-async function loadImages(dir) {
-    const images = [];
-    const labels = [];
+app.use(cors())
+app.use(express.json({
+    limit: '10mb'
+}));
+app.use(express.urlencoded({ extended: true }));
 
-    // Read subdirectories (Formalin and Non formalin)
-    const categories = fs.readdirSync(dir);
+// Load the TensorFlow.js model (not TFLite)
+let model;
 
-    for (const category of categories) {
-        const categoryPath = path.join(dir, category);
+async function loadModel() {
+    const modelPath = path.resolve(__dirname, './model/model.json');
+    model = await tf.loadLayersModel(`file://${modelPath}`);
+    console.log('Model loaded.');
+}
 
-        // Skip if it's not a directory (e.g., .DS_Store)
-        if (!fs.statSync(categoryPath).isDirectory()) {
-            continue;
-        }
+loadModel().catch(console.error);
 
-        // Determine the label based on folder name (0 = Non formalin, 1 = Formalin)
-        const label = category.toLowerCase() === 'formalin' ? 1 : 0;
+// Function to preprocess image for the model
+async function preprocessImage(imageBuffer) {
+    let imageTensor = tf.node.decodeImage(imageBuffer);
 
-        // Read image files from the subdirectory
-        const files = fs.readdirSync(categoryPath);
-
-        for (const file of files) {
-            const filePath = path.join(categoryPath, file);
-
-            // Skip non-image files (like .DS_Store)
-            if (!file.toLowerCase().endsWith('.jpg') && !file.toLowerCase().endsWith('.png')) {
-                continue;
-            }
-
-            const imageBuffer = fs.readFileSync(filePath);
-            let imageTensor = tf.node.decodeImage(imageBuffer);
-
-            // Convert RGBA (4 channels) to RGB (3 channels) if necessary
-            if (imageTensor.shape[2] === 4) {
-                imageTensor = imageTensor.slice([0, 0, 0], [-1, -1, 3]);  // Remove the alpha channel
-            }
-
-            imageTensor = imageTensor
-                .resizeNearestNeighbor([imageHeight, imageWidth])
-                .toFloat()
-                .div(tf.scalar(255.0));
-
-            images.push(imageTensor);
-            labels.push(label);
-        }
+    // Convert RGBA (4 channels) to RGB (3 channels) if necessary
+    if (imageTensor.shape[2] === 4) {
+        imageTensor = imageTensor.slice([0, 0, 0], [-1, -1, 3]);  // Remove the alpha channel
     }
 
-    // Stack tensors into batches
-    const imageBatch = tf.stack(images);
-    const labelBatch = tf.tensor1d(labels, 'int32');
-    return { images: imageBatch, labels: labelBatch };
+    // Resize image to the expected input size
+    imageTensor = imageTensor
+        .resizeNearestNeighbor([224, 224])  // Ganti dengan ukuran input yang sesuai
+        .toFloat()
+        .div(tf.scalar(255.0));
+
+    return imageTensor.expandDims(0);  // Menambahkan dimensi batch
 }
 
+// Endpoint untuk inferensi
+app.post('/predict', async (req, res) => {
+    const { image } = req.body; // Pastikan Anda mengirimkan gambar dalam format yang benar (base64 atau binary)
 
+    try {
+        const imageBuffer = Buffer.from(image, 'base64'); // Ubah base64 ke Buffer
+        const processedImage = await preprocessImage(imageBuffer);
 
+        const prediction = model.predict(processedImage);
+        const probabilities = prediction.dataSync(); // Mendapatkan probabilitas untuk masing-masing kelas
 
-// Build the model
-function createModel() {
-    const model = tf.sequential();
+        // Menghitung persentase
+        const formalinPercentage = probabilities[0] * 100;
+        const nonFormalinPercentage = probabilities[1] * 100;
 
-    // Add layers (equivalent to Keras code)
-    model.add(tf.layers.rescaling({ scale: 1. / 255, inputShape: [imageHeight, imageWidth, 3] }));
-    model.add(tf.layers.conv2d({ filters: 64, kernelSize: 3, activation: 'relu' }));
-    model.add(tf.layers.maxPooling2d({ poolSize: [2, 2] }));
+        // Mengambil hasil prediksi berdasarkan threshold
+        const predictedClass = probabilities[0] > 0.5 ? 'formalin' : 'non formalin'; // Ganti threshold sesuai kebutuhan
 
-    model.add(tf.layers.conv2d({ filters: 128, kernelSize: 3, activation: 'relu' }));
-    model.add(tf.layers.maxPooling2d({ poolSize: [2, 2] }));
+        // Mengembalikan hasil prediksi
+        res.json({
+            detail_prediction: {
+                formalin: `${formalinPercentage.toFixed(2)}%`,
+                non_formalin: `${nonFormalinPercentage.toFixed(2)}%`,
+            },
+            prediction: predictedClass
+        });
+    } catch (error) {
+        console.error('Error during prediction:', error);
+        res.status(500).send('Error during prediction');
+    }
+});
 
-    model.add(tf.layers.conv2d({ filters: 256, kernelSize: 3, activation: 'relu' }));
-    model.add(tf.layers.maxPooling2d({ poolSize: [2, 2] }));
+app.get("/", (req, res) => res.send("Express on Vercel"));
 
-    model.add(tf.layers.flatten());
-
-    model.add(tf.layers.dense({ units: 256, activation: 'relu' }));
-    model.add(tf.layers.dense({ units: 1, activation: 'sigmoid' }));  // Binary classification
-
-    // Compile model
-    model.compile({
-        optimizer: 'adam',
-        loss: 'binaryCrossentropy',
-        metrics: ['accuracy'],
-    });
-
-    return model;
-}
-
-// Train the model
-async function trainModel() {
-    const { images: trainImages, labels: trainLabels } = await loadImages(trainDir);
-
-    const model = createModel();
-
-    // Train the model
-    await model.fit(trainImages, trainLabels, {
-        epochs: 20,
-        batchSize,
-        validationSplit: 0.2,
-    });
-
-    // Save the model to a directory
-    await model.save('file://./model');
-    
-    console.log('Model trained and saved.');
-}
-
-trainModel().catch(console.error);
+// Jalankan server
+app.listen(port, () => {
+    console.log(`Server is running at http://localhost:${port}`);
+});
